@@ -1,34 +1,51 @@
-//! The popover's content: one row per agent with its on/off toggle and bars,
-//! then the shared GitHub section with a contribution graph, then buttons.
+//! The popover ("big numbers" design): a block per shown agent with its main
+//! window as a large percentage and the other windows as thin bars, the
+//! shared GitHub contribution graph, and a row of chips that turn agents and
+//! GitHub on or off. Refresh and the interval sit in the header.
 //! `layout` is used both to size/hit-test (no device context) and to paint.
 
 use crate::config::Config;
 use crate::github::GithubState;
 use crate::icon::severity_color;
-use crate::model::{AgentId, AgentState, Status, format_until};
+use crate::model::{AgentId, AgentState, Status, Window, format_until};
 use jiff::Timestamp;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreatePen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, FillRect, HDC, HFONT, HGDIOBJ, PS_SOLID, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT, FW_NORMAL, FW_SEMIBOLD, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FF_DONTCARE,
+    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+    FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect,
+    GetStockObject, NULL_BRUSH, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 pub const WIDTH: f32 = 340.0;
-const PAD: f32 = 14.0;
+const PAD: f32 = 16.0;
+const INNER: f32 = WIDTH - 2.0 * PAD;
 
-const BG: u32 = 0x1F1F1F;
-const TEXT: u32 = 0xF2F2F2;
-const DIM: u32 = 0x9A9A9A;
-const TRACK: u32 = 0x3A3A3A;
-const DIVIDER: u32 = 0x333333;
-const ON: u32 = 0x0A84FF;
-const OFF: u32 = 0x555555;
-const LINK: u32 = 0x4DA3FF;
+/// Acrylic tint behind the content, 0xAARRGGBB: dark glass.
+pub const GLASS_TINT: u32 = 0x8C1C1C1E;
+/// What "no fill" draws as; the glass shows through it.
+const BG: u32 = 0x000000;
+const TEXT: u32 = 0xF2F2F7;
+const DIM: u32 = 0x8E8E93;
+const TRACK: u32 = 0x48484C;
+const DIVIDER: u32 = 0x55555A;
+const CHIP_ON: u32 = 0x3A3A3E;
+const CHIP_ON_BORDER: u32 = 0x7C7C80;
+const CHIP_OFF_BORDER: u32 = 0x66666B;
+const LINK: u32 = 0x64A8FF;
 /// GitHub's dark-theme contribution shades, level 0..=4.
 const GH_LEVELS: [u32; 5] = [0x2D333B, 0x0E4429, 0x006D32, 0x26A641, 0x39D353];
+/// Segoe Fluent Icons "Refresh".
+const ICON_REFRESH: &str = "\u{E72C}";
+
+fn agent_color(id: AgentId) -> u32 {
+    match id {
+        AgentId::Claude => 0xD97757,
+        AgentId::Codex => 0x10A37F,
+        AgentId::Antigravity => 0x4F8CFF,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -38,7 +55,6 @@ pub enum Action {
     OpenGithub,
     Refresh,
     CycleInterval,
-    Quit,
 }
 
 pub struct View<'a> {
@@ -66,6 +82,10 @@ impl Rect {
     }
 }
 
+fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
+    Rect { x, y, w, h }
+}
+
 pub struct Layout {
     pub height: f32,
     pub hits: Vec<(Rect, Action)>,
@@ -77,16 +97,13 @@ impl Layout {
     }
 }
 
-pub struct Painter {
-    hdc: HDC,
-    scale: f32,
-    fonts: [HFONT; 2],
-}
-
 #[derive(Clone, Copy)]
 enum Font {
-    Bold,
+    Title,
+    Big,
+    Body,
     Small,
+    Icon,
 }
 
 #[derive(Clone, Copy)]
@@ -96,13 +113,19 @@ enum Align {
     Right,
 }
 
+pub struct Painter {
+    hdc: HDC,
+    scale: f32,
+    fonts: [HFONT; 5],
+}
+
 fn colorref(rgb: u32) -> COLORREF {
     COLORREF(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF))
 }
 
 impl Painter {
     pub fn new(hdc: HDC, scale: f32) -> Painter {
-        let font = |size: f32, weight: u32| unsafe {
+        let font = |size: f32, weight: u32, face: PCWSTR| unsafe {
             CreateFontW(
                 -(size * scale).round() as i32,
                 0,
@@ -115,16 +138,23 @@ impl Painter {
                 DEFAULT_CHARSET,
                 OUT_DEFAULT_PRECIS,
                 CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
+                ANTIALIASED_QUALITY,
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-                w!("Segoe UI"),
+                face,
             )
         };
         unsafe { SetBkMode(hdc, TRANSPARENT) };
+        let ui = w!("Segoe UI Variable Text");
         Painter {
             hdc,
             scale,
-            fonts: [font(13.0, FW_SEMIBOLD.0), font(11.5, FW_NORMAL.0)],
+            fonts: [
+                font(13.5, FW_SEMIBOLD.0, ui),
+                font(28.0, FW_SEMIBOLD.0, w!("Segoe UI Variable Display")),
+                font(12.5, FW_NORMAL.0, ui),
+                font(11.5, FW_NORMAL.0, ui),
+                font(12.0, FW_NORMAL.0, w!("Segoe Fluent Icons")),
+            ],
         }
     }
 
@@ -144,12 +174,15 @@ impl Painter {
         }
     }
 
-    fn round(&self, r: Rect, radius: f32, rgb: u32) {
+    /// A rounded rectangle filled with `rgb` and outlined with `border`.
+    fn round(&self, r: Rect, radius: f32, rgb: u32, border: u32) {
         let rc = self.rect(r);
         unsafe {
             let b = CreateSolidBrush(colorref(rgb));
-            let p = CreatePen(PS_SOLID, 1, colorref(rgb));
-            let ob = SelectObject(self.hdc, HGDIOBJ(b.0));
+            let p = CreatePen(PS_SOLID, 1, colorref(border));
+            // BG means "no fill": leave the glass visible inside the outline.
+            let fill = if rgb == BG { GetStockObject(NULL_BRUSH) } else { HGDIOBJ(b.0) };
+            let ob = SelectObject(self.hdc, fill);
             let op = SelectObject(self.hdc, HGDIOBJ(p.0));
             let d = self.px(radius * 2.0).max(1);
             let _ = RoundRect(self.hdc, rc.left, rc.top, rc.right, rc.bottom, d, d);
@@ -158,6 +191,22 @@ impl Painter {
             let _ = DeleteObject(b.into());
             let _ = DeleteObject(p.into());
         }
+    }
+
+    fn solid(&self, r: Rect, radius: f32, rgb: u32) {
+        self.round(r, radius, rgb, rgb);
+    }
+
+    /// Width of `s` in DIPs.
+    fn measure(&self, s: &str, font: Font) -> f32 {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        unsafe {
+            let old = SelectObject(self.hdc, HGDIOBJ(self.fonts[font as usize].0));
+            let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(self.hdc, &wide, &mut size);
+            SelectObject(self.hdc, old);
+        }
+        size.cx as f32 / self.scale
     }
 
     fn text(&self, r: Rect, s: &str, font: Font, rgb: u32, align: Align) {
@@ -191,31 +240,10 @@ impl Drop for Painter {
     }
 }
 
-fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
-    Rect { x, y, w, h }
-}
-
-fn status_text(s: &AgentState, shown: bool, paused: bool) -> String {
-    if !shown {
-        return "Hidden".into();
-    }
-    match s.status {
-        Status::Pending if paused => "Waiting (paused)".into(),
-        Status::Pending => "Loading…".into(),
-        Status::Ok => s.usage.as_ref().and_then(|u| u.plan.clone()).map(capitalize).unwrap_or_default(),
-        Status::SignInRequired => "Sign-in needed".into(),
-        Status::NotFound => "Not found".into(),
-        Status::NotRunning => "Not running".into(),
-        Status::Error => "Error".into(),
-    }
-}
-
-fn capitalize(s: String) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().chain(c).collect(),
-        None => s,
-    }
+/// Approximate text width in DIPs, used for layout without a device
+/// context so painting and hit-testing agree.
+fn text_width(s: &str, size: f32) -> f32 {
+    s.chars().map(|c| if c.is_ascii_uppercase() { 0.68 } else if c == ' ' { 0.3 } else { 0.56 }).sum::<f32>() * size
 }
 
 fn ago(t: Timestamp, now: Timestamp) -> String {
@@ -227,198 +255,287 @@ fn ago(t: Timestamp, now: Timestamp) -> String {
     }
 }
 
+/// "of 5-hour limit" for the big number's caption.
+fn caption(w: &Window) -> String {
+    match w.label.as_str() {
+        "5h" => "of 5-hour limit".into(),
+        "7d" => "of weekly limit".into(),
+        l if l.ends_with(" 7d") => format!("{} weekly", &l[..l.len() - 3]),
+        l if l.ends_with(" 5h") => format!("{} 5-hour", &l[..l.len() - 3]),
+        l => l.to_string(),
+    }
+}
+
+fn secondary_label(w: &Window) -> String {
+    match w.label.as_str() {
+        "7d" => "Weekly".into(),
+        "5h" => "5-hour".into(),
+        l if l.ends_with(" 7d") => format!("{} weekly", &l[..l.len() - 3]),
+        l => l.to_string(),
+    }
+}
+
+fn bar(p: &Painter, area: Rect, used: f64) {
+    p.solid(area, area.h / 2.0, TRACK);
+    let fill = area.w * (used as f32 / 100.0);
+    if used > 0.0 {
+        p.solid(Rect { w: fill.max(area.h), ..area }, area.h / 2.0, severity_color(used));
+    }
+}
+
+fn plan_name(s: &AgentState) -> Option<String> {
+    let p = s.usage.as_ref()?.plan.as_ref()?;
+    let mut c = p.chars();
+    Some(c.next()?.to_uppercase().chain(c).collect())
+}
+
 /// Lays out (and, with a painter, draws) the popover. Returns its height in
 /// DIPs and the clickable areas.
 pub fn layout(v: &View, p: Option<&Painter>) -> Layout {
     let mut hits = Vec::new();
-    let inner = WIDTH - 2.0 * PAD;
     let mut y = PAD;
 
-    // Header.
+    // Header: title, last update, refresh button, interval chip.
+    let interval = format!("{} min", v.config.refresh_minutes);
+    let interval_w = text_width(&interval, 11.5) + 18.0;
+    let interval_area = r(PAD + INNER - interval_w, y - 1.0, interval_w, 22.0);
+    let refresh_area = r(interval_area.x - 30.0, y - 1.0, 26.0, 22.0);
     let latest = v.states.iter().filter_map(|s| s.fetched_at).chain(v.github.fetched_at).max();
-    let header_note = if v.refreshing {
+    let note = if v.refreshing {
         "Refreshing…".to_string()
     } else if v.paused {
-        "Paused (full-screen app)".to_string()
+        "Paused (full screen)".to_string()
     } else {
         latest.map(|t| format!("Updated {}", ago(t, v.now))).unwrap_or_default()
     };
     if let Some(p) = p {
-        p.text(r(PAD, y, inner, 20.0), "Agent usage", Font::Bold, TEXT, Align::Left);
-        p.text(r(PAD, y, inner, 20.0), &header_note, Font::Small, DIM, Align::Right);
+        p.text(r(PAD, y, 120.0, 20.0), "Agent usage", Font::Title, TEXT, Align::Left);
+        p.text(r(PAD + 110.0, y, refresh_area.x - PAD - 116.0, 20.0), &note, Font::Small, DIM, Align::Right);
+        p.round(refresh_area, 11.0, BG, CHIP_OFF_BORDER);
+        p.text(refresh_area, ICON_REFRESH, Font::Icon, if v.refreshing { DIM } else { TEXT }, Align::Center);
+        p.round(interval_area, 11.0, BG, CHIP_OFF_BORDER);
+        p.text(interval_area, &interval, Font::Small, TEXT, Align::Center);
     }
-    y += 28.0;
-
-    for s in v.states {
-        let shown = v.config.is_shown(s.id);
-        toggle_row(p, &mut hits, y, shown, s.id.name(), &status_text(s, shown, v.paused), Action::ToggleAgent(s.id));
-        y += 28.0;
-        if !shown {
-            continue;
-        }
-        if let Some(u) = &s.usage {
-            for w in u.windows.iter().take(4) {
-                if let Some(p) = p {
-                    let bar = r(PAD + 96.0, y + 7.0, 104.0, 6.0);
-                    p.text(r(PAD + 8.0, y, 86.0, 20.0), &w.label, Font::Small, DIM, Align::Left);
-                    p.round(bar, 3.0, TRACK);
-                    let fill = (bar.w * (w.used_percent as f32 / 100.0)).max(if w.used_percent > 0.0 { 3.0 } else { 0.0 });
-                    if fill > 0.0 {
-                        p.round(Rect { w: fill, ..bar }, 3.0, severity_color(w.used_percent));
-                    }
-                    let reset = w.resets_at.and_then(|t| format_until(t, v.now));
-                    let note = match reset {
-                        Some(r) => format!("{:.0}%  ·  {r}", w.used_percent),
-                        None => format!("{:.0}%", w.used_percent),
-                    };
-                    p.text(r(PAD + 204.0, y, inner - 204.0, 20.0), &note, Font::Small, TEXT, Align::Right);
-                }
-                y += 20.0;
-            }
-        }
-        if s.status != Status::Ok
-            && let Some(msg) = &s.message
-        {
-            let stale = s.usage.is_some();
-            if let Some(p) = p {
-                let msg = if stale { format!("Showing last data: {msg}") } else { msg.clone() };
-                p.text(r(PAD + 8.0, y, inner - 8.0, 18.0), &msg, Font::Small, DIM, Align::Left);
-            }
-            y += 18.0;
-        }
-        if s.id == AgentId::Claude && s.status == Status::SignInRequired {
-            let label = if v.signing_in { "Waiting for the browser…" } else { "Sign in with Claude…" };
-            let area = r(PAD + 8.0, y, 180.0, 20.0);
-            if let Some(p) = p {
-                p.text(area, label, Font::Small, LINK, Align::Left);
-            }
-            if !v.signing_in {
-                hits.push((area, Action::SignInClaude));
-            }
-            y += 22.0;
-        }
-        y += 4.0;
-    }
-
-    // Shared GitHub section.
-    divider(p, &mut y, inner);
-    let gh = v.github;
-    let gh_note = if !v.config.show_github {
-        "Hidden".to_string()
-    } else if let Some(c) = &gh.data {
-        format!("@{}  ·  {} this year", c.login, c.total)
-    } else {
-        match gh.status {
-            Status::Pending if v.paused => "Waiting (paused)".into(),
-            Status::Pending => "Loading…".into(),
-            _ => "Unavailable".into(),
-        }
-    };
-    toggle_row(p, &mut hits, y, v.config.show_github, "GitHub", &gh_note, Action::ToggleGithub);
+    hits.push((refresh_area, Action::Refresh));
+    hits.push((interval_area, Action::CycleInterval));
     y += 30.0;
-    if v.config.show_github {
-        if let Some(c) = &gh.data {
-            let cell = 9.0;
-            let pitch = 11.0;
-            let weeks = ((inner + (pitch - cell)) / pitch).floor() as usize;
-            // Whole weeks (days start on Sunday), newest on the right.
-            let last_week = c.days.len().saturating_sub(1) / 7;
-            let first = last_week.saturating_sub(weeks - 1) * 7;
-            let days = &c.days[first.min(c.days.len())..];
-            let grid = r(PAD, y, inner, 7.0 * pitch);
-            if let Some(p) = p {
-                for (i, d) in days.iter().enumerate() {
-                    let (col, row) = (i / 7, i % 7);
-                    let cx = PAD + col as f32 * pitch;
-                    p.round(r(cx, y + row as f32 * pitch, cell, cell), 2.0, GH_LEVELS[d.level.min(4) as usize]);
-                }
-            }
-            hits.push((grid, Action::OpenGithub));
-            y += 7.0 * pitch + 4.0;
-            let week: u32 = days.iter().rev().take(7).map(|d| d.count).sum();
-            let today = c.days.last().map(|d| d.count).unwrap_or(0);
-            if let Some(p) = p {
-                let s = format!("Today {today}  ·  last 7 days {week}");
-                p.text(r(PAD, y, inner, 18.0), &s, Font::Small, DIM, Align::Left);
-                // Legend: Less [5 shades] More, right-aligned like github.com.
-                let right = PAD + inner;
-                p.text(r(right - 28.0, y, 28.0, 18.0), "More", Font::Small, DIM, Align::Right);
-                for (i, shade) in GH_LEVELS.iter().enumerate() {
-                    let x = right - 32.0 - (5 - i) as f32 * pitch;
-                    p.round(r(x, y + 4.5, cell, cell), 2.0, *shade);
-                }
-                p.text(r(right - 32.0 - 5.0 * pitch - 34.0, y, 30.0, 18.0), "Less", Font::Small, DIM, Align::Right);
-            }
-            y += 20.0;
-        } else if let Some(msg) = &gh.message {
-            if let Some(p) = p {
-                p.text(r(PAD + 8.0, y, inner - 8.0, 18.0), msg, Font::Small, DIM, Align::Left);
-            }
-            y += 20.0;
+
+    let shown: Vec<&AgentState> = v.states.iter().filter(|s| v.config.is_shown(s.id)).collect();
+    if shown.is_empty() {
+        if let Some(p) = p {
+            p.text(r(PAD, y, INNER, 20.0), "Turn on an agent below to see its usage.", Font::Body, DIM, Align::Left);
         }
+        y += 28.0;
+        divider(p, &mut y);
+    }
+    for s in shown {
+        agent_block(v, p, &mut hits, &mut y, s);
+        divider(p, &mut y);
     }
 
-    // Buttons.
-    divider(p, &mut y, inner);
-    let buttons = [
-        ("Refresh", Action::Refresh),
-        (&*format!("Every {} min", v.config.refresh_minutes), Action::CycleInterval),
-        ("Quit", Action::Quit),
-    ];
-    let bw = inner / buttons.len() as f32;
-    for (i, (label, action)) in buttons.iter().enumerate() {
-        let area = r(PAD + i as f32 * bw, y, bw, 26.0);
-        if let Some(p) = p {
-            p.round(r(area.x + 3.0, area.y, area.w - 6.0, area.h), 6.0, 0x2C2C2C);
-            p.text(area, label, Font::Small, TEXT, Align::Center);
-        }
-        hits.push((area, *action));
+    if v.config.show_github {
+        github_block(v, p, &mut hits, &mut y);
+        divider(p, &mut y);
     }
-    y += 26.0 + PAD;
+
+    // Chips: which agents (and GitHub) are on.
+    let mut x = PAD;
+    let chips: Vec<(&str, bool, Action, Option<u32>)> = v
+        .states
+        .iter()
+        .map(|s| (s.id.name(), v.config.is_shown(s.id), Action::ToggleAgent(s.id), Some(agent_color(s.id))))
+        .chain(std::iter::once(("GitHub", v.config.show_github, Action::ToggleGithub, None)))
+        .collect();
+    for (name, on, action, dot) in chips {
+        let w = text_width(name, 11.5) + if dot.is_some() { 28.0 } else { 20.0 };
+        let area = r(x, y, w, 24.0);
+        if let Some(p) = p {
+            if on {
+                p.round(area, 12.0, CHIP_ON, CHIP_ON_BORDER);
+            } else {
+                p.round(area, 12.0, BG, CHIP_OFF_BORDER);
+            }
+            let mut tx = x + 10.0;
+            if let Some(c) = dot {
+                p.solid(r(x + 9.0, y + 9.0, 6.0, 6.0), 3.0, if on { c } else { DIM });
+                tx = x + 19.0;
+            }
+            p.text(r(tx, y, w - (tx - x), 24.0), name, Font::Small, if on { TEXT } else { DIM }, Align::Left);
+        }
+        hits.push((area, action));
+        x += w + 5.0;
+    }
+    y += 24.0 + PAD;
     Layout { height: y, hits }
 }
 
-fn divider(p: Option<&Painter>, y: &mut f32, inner: f32) {
-    *y += 4.0;
+fn agent_block(v: &View, p: Option<&Painter>, hits: &mut Vec<(Rect, Action)>, y: &mut f32, s: &AgentState) {
+    let main = s.usage.as_ref().and_then(|u| u.windows.first());
+    // Name row: dot, name, plan; main window's reset on the right.
     if let Some(p) = p {
-        p.fill(r(PAD, *y, inner, 1.0), DIVIDER);
+        p.solid(r(PAD, *y + 6.0, 8.0, 8.0), 4.0, agent_color(s.id));
+        p.text(r(PAD + 14.0, *y, 120.0, 20.0), s.id.name(), Font::Title, TEXT, Align::Left);
+        if let Some(plan) = plan_name(s) {
+            let x = PAD + 14.0 + text_width(s.id.name(), 13.5) + 8.0;
+            p.text(r(x, *y, 80.0, 20.0), &plan, Font::Small, DIM, Align::Left);
+        }
+        let right = match main {
+            Some(w) => w.resets_at.and_then(|t| format_until(t, v.now)).map(|t| format!("resets in {t}")),
+            None => match s.status {
+                Status::Pending if v.paused => Some("waiting (paused)".into()),
+                Status::Pending => Some("loading…".into()),
+                Status::SignInRequired => Some("sign-in needed".into()),
+                Status::NotFound => Some("not found".into()),
+                Status::NotRunning => Some("not running".into()),
+                _ => None,
+            },
+        };
+        if let Some(t) = right {
+            p.text(r(PAD + 150.0, *y, INNER - 150.0, 20.0), &t, Font::Small, DIM, Align::Right);
+        }
     }
-    *y += 9.0;
+    *y += 22.0;
+
+    if let Some(u) = &s.usage
+        && let Some(w) = u.windows.first()
+    {
+        let pct = format!("{:.0}%", w.used_percent);
+        if let Some(p) = p {
+            let big_w = p.measure(&pct, Font::Big);
+            p.text(r(PAD, *y, big_w + 4.0, 34.0), &pct, Font::Big, TEXT, Align::Left);
+            p.text(r(PAD + big_w + 10.0, *y + 6.0, INNER - big_w - 10.0, 26.0), &caption(w), Font::Body, DIM, Align::Left);
+            bar(p, r(PAD, *y + 38.0, INNER, 6.0), w.used_percent);
+        }
+        *y += 54.0;
+        for w in u.windows.iter().skip(1).take(3) {
+            if let Some(p) = p {
+                p.text(r(PAD, *y, 180.0, 16.0), &secondary_label(w), Font::Small, DIM, Align::Left);
+                let reset = w.resets_at.and_then(|t| format_until(t, v.now));
+                let note = match reset {
+                    Some(t) => format!("{:.0}%  ·  {t}", w.used_percent),
+                    None => format!("{:.0}%", w.used_percent),
+                };
+                p.text(r(PAD + 150.0, *y, INNER - 150.0, 16.0), &note, Font::Small, TEXT, Align::Right);
+                bar(p, r(PAD, *y + 19.0, INNER, 4.0), w.used_percent);
+            }
+            *y += 31.0;
+        }
+    }
+
+    if s.status != Status::Ok
+        && let Some(msg) = &s.message
+    {
+        if let Some(p) = p {
+            let msg = if s.usage.is_some() { format!("Last data shown: {msg}") } else { msg.clone() };
+            p.text(r(PAD, *y, INNER, 18.0), &msg, Font::Small, DIM, Align::Left);
+        }
+        *y += 20.0;
+    }
+    if s.id == AgentId::Claude && s.status == Status::SignInRequired {
+        let label = if v.signing_in { "Waiting for the browser…" } else { "Sign in with Claude" };
+        let area = r(PAD, *y, text_width(label, 12.5) + 8.0, 20.0);
+        if let Some(p) = p {
+            p.text(area, label, Font::Body, LINK, Align::Left);
+        }
+        if !v.signing_in {
+            hits.push((area, Action::SignInClaude));
+        }
+        *y += 22.0;
+    }
 }
 
-fn toggle_row(p: Option<&Painter>, hits: &mut Vec<(Rect, Action)>, y: f32, on: bool, name: &str, note: &str, action: Action) {
-    let inner = WIDTH - 2.0 * PAD;
+fn github_block(v: &View, p: Option<&Painter>, hits: &mut Vec<(Rect, Action)>, y: &mut f32) {
+    let gh = v.github;
+    let name = gh.data.as_ref().map(|c| format!("GitHub  ·  @{}", c.login)).unwrap_or_else(|| "GitHub".into());
+    let right = match &gh.data {
+        Some(c) => {
+            let today = c.days.last().map(|d| d.count).unwrap_or(0);
+            let week: u32 = c.days.iter().rev().take(7).map(|d| d.count).sum();
+            format!("Today {today}  ·  7 days {week}")
+        }
+        None => match gh.status {
+            Status::Pending if v.paused => "waiting (paused)".into(),
+            Status::Pending => "loading…".into(),
+            _ => String::new(),
+        },
+    };
     if let Some(p) = p {
-        let pill = r(PAD, y + 3.0, 32.0, 18.0);
-        p.round(pill, 9.0, if on { ON } else { OFF });
-        let knob_x = if on { pill.x + pill.w - 16.0 } else { pill.x + 2.0 };
-        p.round(r(knob_x, pill.y + 2.0, 14.0, 14.0), 7.0, 0xFFFFFF);
-        p.text(r(PAD + 42.0, y, 140.0, 24.0), name, Font::Bold, if on { TEXT } else { DIM }, Align::Left);
-        p.text(r(PAD + 150.0, y, inner - 150.0, 24.0), note, Font::Small, DIM, Align::Right);
+        p.text(r(PAD, *y, 180.0, 20.0), &name, Font::Title, TEXT, Align::Left);
+        p.text(r(PAD + 150.0, *y, INNER - 150.0, 20.0), &right, Font::Small, DIM, Align::Right);
     }
-    // The whole row toggles, not only the pill.
-    hits.push((r(PAD, y, 150.0, 24.0), action));
+    *y += 26.0;
+
+    if let Some(c) = &gh.data {
+        let pitch = INNER / 26.0;
+        let cell = pitch - 2.0;
+        let weeks = 26;
+        // Whole weeks (days start on Sunday), newest on the right.
+        let last_week = c.days.len().saturating_sub(1) / 7;
+        let first = last_week.saturating_sub(weeks - 1) * 7;
+        let days = &c.days[first.min(c.days.len())..];
+        let grid = r(PAD, *y, INNER, 7.0 * pitch);
+        if let Some(p) = p {
+            for (i, d) in days.iter().enumerate() {
+                let (col, row) = ((i / 7) as f32, (i % 7) as f32);
+                p.solid(r(PAD + col * pitch, *y + row * pitch, cell, cell), 2.0, GH_LEVELS[d.level.min(4) as usize]);
+            }
+        }
+        hits.push((grid, Action::OpenGithub));
+        *y += 7.0 * pitch + 6.0;
+        if let Some(p) = p {
+            let s = format!("{} contributions in the last year", c.total);
+            p.text(r(PAD, *y, INNER, 16.0), &s, Font::Small, DIM, Align::Left);
+        }
+        *y += 18.0;
+    } else if let Some(msg) = &gh.message {
+        if let Some(p) = p {
+            p.text(r(PAD, *y, INNER, 18.0), msg, Font::Small, DIM, Align::Left);
+        }
+        *y += 20.0;
+    }
 }
 
-pub fn background() -> u32 {
-    BG
+fn divider(p: Option<&Painter>, y: &mut f32) {
+    *y += 6.0;
+    if let Some(p) = p {
+        p.fill(r(PAD, *y, INNER, 1.0), DIVIDER);
+    }
+    *y += 13.0;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Usage;
+
+    fn view<'a>(states: &'a [AgentState], github: &'a GithubState, config: &'a Config) -> View<'a> {
+        View { states, github, config, refreshing: false, paused: false, signing_in: false, now: Timestamp::now() }
+    }
 
     #[test]
-    fn hit_testing_finds_toggles_and_buttons() {
+    fn chips_and_header_buttons_are_clickable() {
         let states: Vec<AgentState> = AgentId::ALL.iter().map(|a| AgentState::new(*a)).collect();
         let config = Config::default();
         let github = GithubState::default();
-        let v = View { states: &states, github: &github, config: &config, refreshing: false, paused: false, signing_in: false, now: Timestamp::now() };
-        let l = layout(&v, None);
-        assert!(l.height > 150.0);
-        assert_eq!(l.hit(PAD + 5.0, PAD + 28.0 + 10.0), Some(Action::ToggleAgent(AgentId::Claude)));
-        assert_eq!(l.hit(PAD + 5.0, l.height - PAD - 10.0), Some(Action::Refresh));
-        assert_eq!(l.hit(WIDTH - PAD - 5.0, l.height - PAD - 10.0), Some(Action::Quit));
+        let l = layout(&view(&states, &github, &config), None);
+        let chip_y = l.height - PAD - 12.0;
+        assert_eq!(l.hit(PAD + 5.0, chip_y), Some(Action::ToggleAgent(AgentId::Claude)));
         assert!(l.hits.iter().any(|(_, a)| *a == Action::ToggleGithub));
+        assert!(l.hits.iter().all(|(r, _)| r.x + r.w <= WIDTH - PAD + 0.5), "chips overflow");
+        assert_eq!(l.hit(WIDTH - PAD - 5.0, PAD + 5.0), Some(Action::CycleInterval));
+    }
+
+    #[test]
+    fn blocks_grow_with_windows() {
+        let mut states: Vec<AgentState> = AgentId::ALL.iter().map(|a| AgentState::new(*a)).collect();
+        let config = Config::default();
+        let github = GithubState::default();
+        let before = layout(&view(&states, &github, &config), None).height;
+        let w = |label: &str| Window { id: label.into(), label: label.into(), used_percent: 50.0, resets_at: None };
+        states[0].apply(Ok(Usage { plan: None, source: "test", windows: vec![w("5h"), w("7d")] }), Timestamp::now());
+        assert!(layout(&view(&states, &github, &config), None).height > before + 50.0);
+        assert_eq!(caption(&w("5h")), "of 5-hour limit");
+        assert_eq!(caption(&w("Gemini 7d")), "Gemini weekly");
+        assert_eq!(secondary_label(&w("7d")), "Weekly");
     }
 }

@@ -9,6 +9,7 @@
 mod app;
 mod config;
 mod github;
+mod glass;
 mod http;
 mod icon;
 mod log;

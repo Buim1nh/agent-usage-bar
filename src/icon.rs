@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
-pub const GREEN: u32 = 0x34C759;
+pub const GREEN: u32 = 0x30D158;
 pub const AMBER: u32 = 0xFF9F0A;
 pub const RED: u32 = 0xFF453A;
 const TRACK: u32 = 0x9A9A9A;

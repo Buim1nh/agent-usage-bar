@@ -9,12 +9,13 @@ trang hồ sơ GitHub.
 
 - Biểu tượng trên khay vẽ hai thanh cho mỗi agent đang bật (cửa sổ 5 giờ và
   7 ngày): xanh lá, chuyển cam từ 70 %, đỏ từ 90 %. Rê chuột để xem số.
-- Bấm vào biểu tượng để mở popover: mỗi agent có một nút bật/tắt (agent tắt
-  thì không lấy dữ liệu), từng cửa sổ hạn mức kèm thời điểm reset, biểu đồ
-  đóng góp GitHub, cùng các nút làm mới, đổi chu kỳ (5–60 phút, mặc định 10)
-  và thoát.
-- Chuột phải để đăng nhập, đăng xuất, mở thư mục dữ liệu và bật/tắt tạm dừng
-  khi có ứng dụng toàn màn hình.
+- Bấm vào biểu tượng để mở popover dạng kính mờ (acrylic): hạn mức chính của
+  mỗi agent hiện bằng số % lớn kèm thời gian reset, các cửa sổ còn lại là
+  thanh mỏng, biểu đồ đóng góp GitHub, các chip bật/tắt từng agent và GitHub
+  (agent tắt thì không lấy dữ liệu), cùng nút làm mới và đổi chu kỳ (5–60
+  phút, mặc định 10).
+- Chuột phải để đăng nhập, đăng xuất, mở thư mục dữ liệu, bật/tắt tạm dừng
+  khi có ứng dụng toàn màn hình và thoát.
 - Chỉ làm mới theo bộ hẹn giờ, không polling liên tục. Khi một ứng dụng toàn
   màn hình (game, video) đang ở phía trước, các lần làm mới qua mạng được bỏ
   qua và tiếp tục khi ứng dụng đó thoát.

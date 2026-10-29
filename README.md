@@ -9,11 +9,13 @@ GitHub profile.
 
 - The tray icon draws two bars per shown agent (5-hour and weekly window),
   green, amber from 70 %, red from 90 %. Hover for the numbers.
-- Click the icon for the popover: a toggle per agent (hidden agents are not
-  fetched), every window with its reset time, the GitHub contribution graph,
-  and buttons to refresh, change the interval (5–60 min, default 10) or quit.
-- Right-click for sign-in, sign-out, the data folder and the full-screen
-  pause option.
+- Click the icon for the glass (acrylic) popover: each agent's main limit as
+  a big percentage with its reset time, the other windows as thin bars, the
+  GitHub contribution graph, chips that turn agents and GitHub on or off
+  (hidden agents are not fetched), and buttons to refresh or change the
+  interval (5–60 min, default 10).
+- Right-click for sign-in, sign-out, the data folder, the full-screen pause
+  option and Quit.
 - Refreshes on a timer only; no busy polling. Network refreshes are skipped
   while a full-screen app (game, video) is in front and resume once it is gone.
 - Writes the current numbers to `%LOCALAPPDATA%\agent-usage-bar\status.json`

@@ -12,8 +12,10 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, CreateSolidBrush, DIB_RGB_COLORS, FillRect, GdiFlush, HBITMAP,
+    HDC, BeginPaint, BitBlt, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW,
     HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -119,6 +121,16 @@ pub fn run() {
             (&raw const round).cast(),
             size_of_val(&round) as u32,
         );
+        let dark = windows::core::BOOL::from(true);
+        let _ = DwmSetWindowAttribute(
+            popover,
+            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw const dark).cast(),
+            size_of_val(&dark) as u32,
+        );
+        if !crate::glass::set_acrylic(popover, popover::GLASS_TINT) {
+            crate::log::warn("acrylic unavailable; popover is drawn without blur");
+        }
 
         let inbox: Inbox = Default::default();
         let target = hwnd.0 as isize;
@@ -286,7 +298,6 @@ impl App {
                 self.arm_refresh_timer();
                 self.changed();
             }
-            Action::Quit => unsafe { PostQuitMessage(0) },
         }
     }
 
@@ -571,6 +582,8 @@ impl App {
         }
     }
 
+    /// Draws the content twice (on black and on white) into 32-bit DIBs,
+    /// recovers per-pixel alpha and copies the result over the acrylic.
     fn paint_popover(&mut self) {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
@@ -578,29 +591,75 @@ impl App {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.popover, &mut rc);
             let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-            let mem = CreateCompatibleDC(Some(hdc));
-            let bmp = CreateCompatibleBitmap(hdc, w, h);
-            let old = SelectObject(mem, HGDIOBJ(bmp.0));
-            {
-                let brush = windows::Win32::Graphics::Gdi::CreateSolidBrush(windows::Win32::Foundation::COLORREF(
-                    bgr(popover::background()),
-                ));
-                windows::Win32::Graphics::Gdi::FillRect(mem, &rc, brush);
+            let mut passes = Vec::new();
+            for bg in [0x000000u32, 0xFFFFFF] {
+                let Some(dib) = Dib::new(hdc, w, h) else { break };
+                let brush = CreateSolidBrush(COLORREF(bg));
+                FillRect(dib.dc, &rc, brush);
                 let _ = DeleteObject(brush.into());
-                let painter = Painter::new(mem, self.popover_scale);
-                popover::layout(&self.view(), Some(&painter));
+                {
+                    let painter = Painter::new(dib.dc, self.popover_scale);
+                    popover::layout(&self.view(), Some(&painter));
+                }
+                let _ = GdiFlush();
+                passes.push(dib);
             }
-            let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-            let _ = DeleteObject(bmp.into());
-            let _ = DeleteDC(mem);
+            if let [black, white] = passes.as_slice() {
+                crate::glass::unmatte(black.pixels(), white.pixels());
+                let _ = BitBlt(hdc, 0, 0, w, h, Some(black.dc), 0, 0, SRCCOPY);
+            }
+            drop(passes);
             let _ = EndPaint(self.popover, &ps);
         }
     }
 }
 
-fn bgr(rgb: u32) -> u32 {
-    ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
+/// A top-down 32-bit DIB selected into its own memory DC.
+struct Dib {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u32,
+    len: usize,
+}
+
+impl Dib {
+    unsafe fn new(hdc: HDC, w: i32, h: i32) -> Option<Dib> {
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let dc = CreateCompatibleDC(Some(hdc));
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            Some(Dib { dc, bmp, old, bits: bits.cast(), len: (w * h).max(0) as usize })
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn pixels(&self) -> &mut [u32] {
+        unsafe { std::slice::from_raw_parts_mut(self.bits, self.len) }
+    }
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(self.bmp.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
 }
 
 fn set_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
