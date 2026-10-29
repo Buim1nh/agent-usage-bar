@@ -148,10 +148,10 @@ pub fn run() {
         with_app(|a| {
             a.add_tray_icon();
             a.arm_refresh_timer();
-            a.refresh(None, true);
+            a.refresh(None, true, false);
             // `--show` opens the popover at start (handy after install and for screenshots).
             if std::env::args().any(|a| a == "--show") {
-                a.show_popover();
+                a.show_popover(None);
             }
         });
 
@@ -179,9 +179,14 @@ impl App {
         }
         match msg {
             WM_TRAY => {
+                // NOTIFYICON_VERSION_4: hosts (explorer, wdock) send WM_LBUTTONUP
+                // *and* NIN_SELECT for one click, WM_RBUTTONUP *and*
+                // WM_CONTEXTMENU for one right-click; react to one of each.
+                // wParam carries the icon's anchor point in screen pixels.
+                let anchor = POINT { x: (wparam.0 & 0xFFFF) as i16 as i32, y: ((wparam.0 >> 16) & 0xFFFF) as i16 as i32 };
                 match (lparam.0 & 0xFFFF) as u32 {
-                    NIN_SELECT | WM_LBUTTONUP => self.toggle_popover(),
-                    WM_CONTEXTMENU | WM_RBUTTONUP => self.context_menu(),
+                    NIN_SELECT => self.toggle_popover(Some(anchor)),
+                    WM_CONTEXTMENU => self.context_menu(),
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -192,11 +197,11 @@ impl App {
             }
             WM_TIMER => {
                 match wparam.0 {
-                    TIMER_REFRESH => self.refresh(None, true),
+                    TIMER_REFRESH => self.refresh(None, true, false),
                     TIMER_RETRY
                         if !self.fullscreen() => {
                             self.disarm_retry();
-                            self.refresh(None, true);
+                            self.refresh(None, true, false);
                         }
                     _ => {}
                 }
@@ -257,7 +262,7 @@ impl App {
                 self.config.toggle(id);
                 self.config.save();
                 if self.config.is_shown(id) {
-                    self.refresh(Some(vec![id]), false);
+                    self.refresh(Some(vec![id]), false, true);
                 }
                 self.changed();
             }
@@ -265,7 +270,7 @@ impl App {
                 self.config.show_github = !self.config.show_github;
                 self.config.save();
                 if self.config.show_github {
-                    self.refresh(Some(Vec::new()), true);
+                    self.refresh(Some(Vec::new()), true, true);
                 }
                 self.changed();
             }
@@ -298,18 +303,19 @@ impl App {
             return;
         }
         self.disarm_retry();
-        self.refresh(None, true);
+        self.refresh(None, true, true);
     }
 
     fn fullscreen(&self) -> bool {
         self.config.pause_when_fullscreen && crate::shell::fullscreen_app_in_front()
     }
 
-    /// Queues a refresh of `agents` (default: all shown ones). Network
-    /// refreshes are deferred while a full-screen app is in front.
-    fn refresh(&mut self, agents: Option<Vec<AgentId>>, with_github: bool) {
+    /// Queues a refresh of `agents` (default: all shown ones). Timer-driven
+    /// network refreshes are deferred while a full-screen app is in front;
+    /// ones the user asked for (`by_user`: popover, buttons) are not.
+    fn refresh(&mut self, agents: Option<Vec<AgentId>>, with_github: bool, by_user: bool) {
         let agents = agents.unwrap_or_else(|| self.config.shown.clone());
-        let network = !self.fullscreen();
+        let network = by_user || !self.fullscreen();
         self.paused = !network;
         if !network && !self.retry_armed {
             unsafe { SetTimer(Some(self.hwnd), TIMER_RETRY, RETRY_MS, None) };
@@ -350,7 +356,7 @@ impl App {
                     self.signing_in = false;
                     if r.is_ok() {
                         self.last_refresh = None;
-                        self.refresh(Some(vec![AgentId::Claude]), false);
+                        self.refresh(Some(vec![AgentId::Claude]), false, true);
                     }
                 }
             }
@@ -474,7 +480,7 @@ impl App {
                 MENU_SIGN_OUT => {
                     crate::providers::claude::delete_own_token();
                     self.last_refresh = None;
-                    self.refresh(Some(vec![AgentId::Claude]), false);
+                    self.refresh(Some(vec![AgentId::Claude]), false, true);
                 }
                 MENU_FOLDER => {
                     let _ = std::fs::create_dir_all(crate::paths::data_dir());
@@ -496,7 +502,7 @@ impl App {
         unsafe { IsWindowVisible(self.popover).as_bool() }
     }
 
-    fn toggle_popover(&mut self) {
+    fn toggle_popover(&mut self, anchor: Option<POINT>) {
         if self.popover_visible() {
             self.hide_popover();
             return;
@@ -505,13 +511,15 @@ impl App {
         if self.popover_hidden_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
             return;
         }
-        self.show_popover();
+        self.show_popover(anchor);
     }
 
-    fn show_popover(&mut self) {
+    /// Opens the popover next to `anchor` (the tray icon), or the cursor.
+    fn show_popover(&mut self, anchor: Option<POINT>) {
         unsafe {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
+            let pt = anchor.filter(|a| a.x != 0 || a.y != 0).unwrap_or(pt);
             let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
             let (mut dx, mut dy) = (96u32, 96u32);
             let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
@@ -528,9 +536,11 @@ impl App {
             let _ = SetWindowPos(self.popover, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
             let _ = SetForegroundWindow(self.popover);
         }
-        // Opening the popover is a good moment for fresh numbers.
-        if self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(120)) {
-            self.refresh(None, true);
+        // Opening the popover is a good moment for fresh numbers, and the
+        // moment to catch up on anything a full-screen pause skipped.
+        let stale = self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(120));
+        if !self.refreshing && (stale || self.paused) {
+            self.refresh(None, true, true);
         }
     }
 
